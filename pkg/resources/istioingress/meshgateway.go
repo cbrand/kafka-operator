@@ -30,7 +30,9 @@ import (
 	kafkautils "github.com/banzaicloud/kafka-operator/pkg/util/kafka"
 )
 
-func (r *Reconciler) meshgateway(log logr.Logger, externalListenerConfig v1beta1.ExternalListenerConfig) runtime.Object {
+func (r *Reconciler) meshgateway(log logr.Logger, externalListenerConfig v1beta1.ExternalListenerConfig,
+	ingressConfig v1beta1.IngressConfig, ingressConfigName, defaultIngressConfigName string) runtime.Object {
+
 	mgateway := &istioOperatorApi.MeshGateway{
 		ObjectMeta: templates.ObjectMeta(
 			fmt.Sprintf(istioingressutils.MeshGatewayNameTemplate, externalListenerConfig.Name, r.KafkaCluster.Name),
@@ -38,22 +40,23 @@ func (r *Reconciler) meshgateway(log logr.Logger, externalListenerConfig v1beta1
 		Spec: istioOperatorApi.MeshGatewaySpec{
 			MeshGatewayConfiguration: istioOperatorApi.MeshGatewayConfiguration{
 				Labels:             labelsForIstioIngress(r.KafkaCluster.Name, externalListenerConfig.Name),
-				ServiceAnnotations: externalListenerConfig.GetServiceAnnotations(),
+				ServiceAnnotations: ingressConfig.GetServiceAnnotations(),
 				BaseK8sResourceConfigurationWithHPAWithoutImage: istioOperatorApi.BaseK8sResourceConfigurationWithHPAWithoutImage{
-					ReplicaCount: util.Int32Pointer(r.KafkaCluster.Spec.IstioIngressConfig.GetReplicas()),
-					MinReplicas:  util.Int32Pointer(r.KafkaCluster.Spec.IstioIngressConfig.GetReplicas()),
-					MaxReplicas:  util.Int32Pointer(r.KafkaCluster.Spec.IstioIngressConfig.GetReplicas()),
+					ReplicaCount: util.Int32Pointer(ingressConfig.IstioIngressConfig.GetReplicas()),
+					MinReplicas:  util.Int32Pointer(ingressConfig.IstioIngressConfig.GetReplicas()),
+					MaxReplicas:  util.Int32Pointer(ingressConfig.IstioIngressConfig.GetReplicas()),
 					BaseK8sResourceConfiguration: istioOperatorApi.BaseK8sResourceConfiguration{
-						Resources:      r.KafkaCluster.Spec.IstioIngressConfig.GetResources(),
-						NodeSelector:   r.KafkaCluster.Spec.IstioIngressConfig.NodeSelector,
-						Tolerations:    r.KafkaCluster.Spec.IstioIngressConfig.Tolerations,
-						PodAnnotations: r.KafkaCluster.Spec.IstioIngressConfig.GetAnnotations(),
+						Resources:      ingressConfig.IstioIngressConfig.GetResources(),
+						NodeSelector:   ingressConfig.IstioIngressConfig.NodeSelector,
+						Tolerations:    ingressConfig.IstioIngressConfig.Tolerations,
+						PodAnnotations: ingressConfig.IstioIngressConfig.GetAnnotations(),
 					},
 				},
-				ServiceType: corev1.ServiceTypeLoadBalancer,
+				ServiceType: externalListenerConfig.GetServiceType(),
 			},
-			Ports: generateExternalPorts(util.GetBrokerIdsFromStatusAndSpec(r.KafkaCluster.Status.BrokersState, r.KafkaCluster.Spec.Brokers, log),
-				externalListenerConfig),
+			Ports: generateExternalPorts(r.KafkaCluster.Spec,
+				util.GetBrokerIdsFromStatusAndSpec(r.KafkaCluster.Status.BrokersState, r.KafkaCluster.Spec.Brokers, log),
+				externalListenerConfig, log, ingressConfigName, defaultIngressConfigName),
 			Type: istioOperatorApi.GatewayTypeIngress,
 		},
 	}
@@ -61,14 +64,40 @@ func (r *Reconciler) meshgateway(log logr.Logger, externalListenerConfig v1beta1
 	return mgateway
 }
 
-func generateExternalPorts(brokerIds []int, externalListenerConfig v1beta1.ExternalListenerConfig) []corev1.ServicePort {
+func generateExternalPorts(kc v1beta1.KafkaClusterSpec, brokerIds []int,
+	externalListenerConfig v1beta1.ExternalListenerConfig, log logr.Logger, ingressConfigName, defaultIngressConfigName string) []corev1.ServicePort {
+
 	generatedPorts := make([]corev1.ServicePort, 0)
+	var err error
 	for _, brokerId := range brokerIds {
-		generatedPorts = append(generatedPorts, corev1.ServicePort{
-			Name:       fmt.Sprintf("tcp-broker-%d", brokerId),
-			TargetPort: intstr.FromInt(int(externalListenerConfig.ExternalStartingPort) + brokerId),
-			Port:       externalListenerConfig.ExternalStartingPort + int32(brokerId),
-		})
+		brokerConfig := &v1beta1.BrokerConfig{}
+		brokerIdPresent := false
+		var requiredBroker v1beta1.Broker
+		// This check is used in case of broker delete. In case of broker delete there is some time when the CC removes the broker
+		// gracefully which means we have to generate the port for that broker as well. At that time the status contains
+		// but the broker spec does not contain the required config values.
+		for _, broker := range kc.Brokers {
+			if int(broker.Id) == brokerId {
+				brokerIdPresent = true
+				requiredBroker = broker
+				break
+			}
+		}
+		if brokerIdPresent {
+			brokerConfig, err = util.GetBrokerConfig(requiredBroker, kc)
+			if err != nil {
+				log.Error(err, "could not determine brokerConfig")
+				continue
+			}
+		}
+		if (len(brokerConfig.BrokerIdBindings) == 0 && ingressConfigName == defaultIngressConfigName) ||
+			util.StringSliceContains(brokerConfig.BrokerIdBindings, ingressConfigName) {
+			generatedPorts = append(generatedPorts, corev1.ServicePort{
+				Name:       fmt.Sprintf("tcp-broker-%d", brokerId),
+				TargetPort: intstr.FromInt(int(externalListenerConfig.ExternalStartingPort) + brokerId),
+				Port:       externalListenerConfig.ExternalStartingPort + int32(brokerId),
+			})
+		}
 	}
 
 	generatedPorts = append(generatedPorts, corev1.ServicePort{
