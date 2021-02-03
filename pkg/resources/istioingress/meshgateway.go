@@ -90,8 +90,7 @@ func generateExternalPorts(kc v1beta1.KafkaClusterSpec, brokerIds []int,
 				continue
 			}
 		}
-		if (len(brokerConfig.BrokerIdBindings) == 0 && ingressConfigName == defaultIngressConfigName) ||
-			util.StringSliceContains(brokerConfig.BrokerIdBindings, ingressConfigName) {
+		if util.ShouldIncludeBroker(brokerConfig, defaultIngressConfigName, ingressConfigName) {
 			generatedPorts = append(generatedPorts, corev1.ServicePort{
 				Name:       fmt.Sprintf("tcp-broker-%d", brokerId),
 				TargetPort: intstr.FromInt(int(externalListenerConfig.ExternalStartingPort) + brokerId),
